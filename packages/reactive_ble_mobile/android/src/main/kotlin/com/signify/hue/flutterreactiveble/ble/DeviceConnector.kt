@@ -87,6 +87,13 @@ internal class DeviceConnector(
         connectionDisposable?.dispose()
         connectDeviceSubject.onComplete()
         connectionStatusUpdates.dispose()
+        // removeFromQueue otherwise only fires in establishConnection's
+        // doOnNext/doOnError, i.e. when a connection RESULT is emitted. A connect
+        // disposed BEFORE it resolves (e.g. cancelled while still connecting to an
+        // absent peripheral) tears down the chain without ever emitting, so its
+        // deviceId is stranded at the head of the queue and every later connect to
+        // a DIFFERENT device blocks forever in waitUntilFirstOfQueue. Dequeue here.
+        connectionQueue.removeFromQueue(device.macAddress)
     }
 
     private fun establishConnection(rxBleDevice: RxBleDevice): Disposable {
