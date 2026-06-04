@@ -4,6 +4,8 @@ import androidx.annotation.VisibleForTesting
 import com.polidea.rxandroidble2.RxBleConnection
 import com.polidea.rxandroidble2.RxBleCustomOperation
 import com.polidea.rxandroidble2.RxBleDevice
+import com.polidea.rxandroidble2.exceptions.BleDisconnectedException
+import com.polidea.rxandroidble2.exceptions.BleGattException
 import com.signify.hue.flutterreactiveble.model.ConnectionState
 import com.signify.hue.flutterreactiveble.model.toConnectionState
 import com.signify.hue.flutterreactiveble.utils.Duration
@@ -96,6 +98,24 @@ internal class DeviceConnector(
         connectionQueue.removeFromQueue(device.macAddress)
     }
 
+    // RxAndroidBle keeps the HCI/GATT disconnect status in a dedicated field
+    // (BleDisconnectedException.state / BleGattException.status), NOT in the
+    // throwable message. Surface it as `status=0xNN` so Dart consumers can route
+    // on the real reason — 0x05 auth failure (stale bond → re-pair), 0x13 remote
+    // termination, 0x08 supervision timeout, 0x1a out-of-range — instead of
+    // collapsing every disconnect to an unclassifiable "Unknown error".
+    private fun errorMessageWithStatus(error: Throwable): String {
+        val base = error.message ?: "Unknown error"
+        val status: Int =
+            when (error) {
+                is BleDisconnectedException -> error.state
+                is BleGattException -> error.status
+                else -> return base
+            }
+        if (status < 0) return base
+        return "%s status=0x%02x".format(base, status)
+    }
+
     private fun establishConnection(rxBleDevice: RxBleDevice): Disposable {
         val deviceId = rxBleDevice.macAddress
 
@@ -120,7 +140,7 @@ internal class DeviceConnector(
             .onErrorReturn { error ->
                 EstablishConnectionFailure(
                     rxBleDevice.macAddress,
-                    error.message ?: "Unknown error",
+                    errorMessageWithStatus(error),
                 )
             }
             .doOnNext {
