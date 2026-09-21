@@ -391,6 +391,10 @@ final class Central {
             in: peripheral.identifier,
             action: { $0.cancel(error: error) }
         )
+        readRssiRegistry.updateTasks(
+            in: peripheral.identifier,
+            action: { $0.cancel(error: error) }
+        )
     }
 
     private func resolve(known peripheralID: PeripheralID) throws -> CBPeripheral {
