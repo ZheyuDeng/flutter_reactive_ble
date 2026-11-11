@@ -43,6 +43,12 @@ registry.registerTask(key: 1, params: 0, timeout: (0.01, { expired += 1 }), comp
 registry.updateTask(key: 1) { $0.task.with(state: $0.task.state.processing(0)) }
 RunLoop.current.run(until: Date().addingTimeInterval(0.04))
 precondition(expired == 1, "a real foreground timeout must still expire")
+for _ in 0..<2 {
+    registry.registerTask(key: 2, params: 0, completion: { _ in completed += 1 })
+}
+registry.updateTask(key: 2) { $0.task.with(state: $0.task.state.processing(0)) }
+registry.updateTasks(in: 2) { $0.task.with(state: $0.task.state.finished(0)) }
+precondition(completed == 3, "retirement must clear both running and queued old tasks")
 print("Native timeout regression checks passed")
 ''')
 (out / 'main.swift').write_text('\n'.join(parts))

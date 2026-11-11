@@ -82,6 +82,9 @@ final class Central {
             return
         }
         if peripheral.state == .disconnected {
+            // A missing terminal callback may have left an old registry task
+            // at the head of this peripheral's queue. Retire it before retry.
+            retireConnectionTasks(peripheral)
             completion(true)
             return
         }
@@ -91,6 +94,14 @@ final class Central {
             // No acknowledgement means no permission to start a competing attempt.
             self?.pendingRecovery.removeValue(forKey: id)?(false)
         }
+    }
+
+    private func retireConnectionTasks(_ peripheral: CBPeripheral) {
+        connectRegistry.updateTasks(in: peripheral.identifier) {
+            $0.cancel(centralManager: self.centralManager, peripheral: peripheral,
+                      error: PluginError.connectionLost)
+        }
+        eject(peripheral, error: PluginError.connectionLost)
     }
 
     // Peripherals iOS handed back on a state-restoration relaunch. Held only so
@@ -157,7 +168,10 @@ final class Central {
                 onConnectionChange(central, peripheral, change)
                 switch change {
                 case .disconnected, .failedToConnect:
-                    central.pendingRecovery.removeValue(forKey: peripheral.identifier)?(true)
+                    if let recovered = central.pendingRecovery.removeValue(forKey: peripheral.identifier) {
+                        central.retireConnectionTasks(peripheral)
+                        recovered(true)
+                    }
                 case .connected: break
                 }
             },
