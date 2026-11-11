@@ -1,4 +1,7 @@
 import CoreBluetooth
+#if os(iOS)
+import UIKit
+#endif
 
 typealias RSSI = Int
 
@@ -58,6 +61,38 @@ final class Central {
     private let characteristicNotifyRegistry = PeripheralTaskRegistry<CharacteristicNotifyTaskController>()
     private let characteristicWriteRegistry = PeripheralTaskRegistry<CharacteristicWriteTaskController>()
     private let readRssiRegistry = PeripheralTaskRegistry<ReadRssiTaskController>()
+    private var pendingRecovery = [PeripheralID: (Bool) -> Void]()
+
+    /// Called on the central's main queue. A queued didConnect must win over
+    /// timeout recovery; never cancel a link that the OS already established.
+    func recoverPendingConnection(_ id: PeripheralID, completion: @escaping (Bool) -> Void) {
+        #if os(iOS)
+        guard UIApplication.shared.applicationState == .active else {
+            completion(false)
+            return
+        }
+        #endif
+        guard pendingRecovery[id] == nil, let peripheral = try? resolve(known: id) else {
+            completion(false)
+            return
+        }
+        if peripheral.state == .connected {
+            connectRegistry.updateTask(key: id, action: { $0.handleConnectionChange(.connected) })
+            completion(false)
+            return
+        }
+        if peripheral.state == .disconnected {
+            completion(true)
+            return
+        }
+        pendingRecovery[id] = completion
+        disconnect(from: id)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            // No acknowledgement means no permission to start a competing attempt.
+            self?.pendingRecovery.removeValue(forKey: id)?(false)
+        }
+    }
+
     // Peripherals iOS handed back on a state-restoration relaunch. Held only so
     // CoreBluetooth keeps their links until Dart connects to them again.
     private var restoredPeripherals = [PeripheralID: CBPeripheral]()
@@ -120,6 +155,11 @@ final class Central {
                 }
 
                 onConnectionChange(central, peripheral, change)
+                switch change {
+                case .disconnected, .failedToConnect:
+                    central.pendingRecovery.removeValue(forKey: peripheral.identifier)?(true)
+                case .connected: break
+                }
             },
             onRestore: papply(weak: self) { central, peripherals in
                 central.trace("state_restored", fields: ["peripheral_count": peripherals.count])
@@ -223,6 +263,12 @@ final class Central {
                     central.disconnect(from: peripheralID)
                 }
             )},
+            timeoutAllowed: { [weak peripheral] in
+                #if os(iOS)
+                guard UIApplication.shared.applicationState == .active else { return false }
+                #endif
+                return peripheral?.state != .connected
+            },
             completion: papply(weak: self) { central, connectionChange in
                 switch connectionChange {
                 case .connected:
