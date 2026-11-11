@@ -61,7 +61,7 @@ final class Central {
     private let characteristicNotifyRegistry = PeripheralTaskRegistry<CharacteristicNotifyTaskController>()
     private let characteristicWriteRegistry = PeripheralTaskRegistry<CharacteristicWriteTaskController>()
     private let readRssiRegistry = PeripheralTaskRegistry<ReadRssiTaskController>()
-    private var pendingRecovery = [PeripheralID: (Bool) -> Void]()
+    private var pendingRecovery = [PeripheralID: PendingConnectionRecovery]()
 
     /// Called on the central's main queue. A queued didConnect must win over
     /// timeout recovery; never cancel a link that the OS already established.
@@ -88,11 +88,15 @@ final class Central {
             completion(true)
             return
         }
-        pendingRecovery[id] = completion
+        let request = PendingConnectionRecovery(completion)
+        pendingRecovery[id] = request
         disconnect(from: id)
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
             // No acknowledgement means no permission to start a competing attempt.
-            self?.pendingRecovery.removeValue(forKey: id)?(false)
+            if self?.pendingRecovery[id] === request {
+                self?.pendingRecovery.removeValue(forKey: id)
+            }
+            request.finish(false)
         }
     }
 
@@ -170,7 +174,7 @@ final class Central {
                 case .disconnected, .failedToConnect:
                     if let recovered = central.pendingRecovery.removeValue(forKey: peripheral.identifier) {
                         central.retireConnectionTasks(peripheral)
-                        recovered(true)
+                        recovered.finish(true)
                     }
                 case .connected: break
                 }
@@ -242,7 +246,16 @@ final class Central {
         trace("central_created")
     }
 
-    deinit { trace("central_released") }
+    deinit {
+        finishPendingRecoveries()
+        trace("central_released")
+    }
+
+    private func finishPendingRecoveries() {
+        let requests = Array(pendingRecovery.values)
+        pendingRecovery.removeAll()
+        requests.forEach { $0.finish(false) }
+    }
 
     var state: CBManagerState { return centralManager.state }
 
@@ -314,6 +327,7 @@ final class Central {
     }
 
     func disconnectAll() {
+        finishPendingRecoveries()
         activePeripherals
             .values
             .forEach { peripheral in
