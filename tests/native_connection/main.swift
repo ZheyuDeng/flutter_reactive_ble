@@ -112,12 +112,25 @@ if !base {
     func scenario(_ name: String, _ body: (Central, CBCentralManager, CBPeripheral) -> Void) {
         UIApplication.shared.applicationState = .active
         let c = Central(onStateChange: { _, _ in }, onDiscovery: { _, _, _, _ in },
-            onConnectionChange: { _, _, _ in }, onServicesWithCharacteristicsInitialDiscovery: { _, _, _ in },
+            onConnectionChange: { _, _, _ in events.append("scenario-event") }, onServicesWithCharacteristicsInitialDiscovery: { _, _, _ in },
             onCharacteristicValueUpdate: { _, _, _, _ in })
         let m = CBCentralManager.latest!, p = CBPeripheral()
         m.peripherals[p.identifier] = p
         body(c, m, p)
         print("PASS integrated recovery: \(name)")
+    }
+    scenario("queue replacement before terminal cleanup on an already-disconnected link") { c, m, p in
+        try! c.connect(to: p.identifier, discover: .all, timeout: 2)
+        m.connected(p)
+        p.state = .disconnected
+        let publications = events.count
+        try! c.connect(to: p.identifier, discover: .all, timeout: 2)
+        precondition(m.connects.count == 1 && events.count == publications)
+        m.disconnected(p)
+        precondition(m.connects.count == 2 && events.count == publications,
+            "Old terminal event must not close the replacement stream")
+        m.connected(p)
+        precondition(p.discoveryCalls == 2)
     }
     scenario("recovery joins cancellation, acknowledges only after cleanup") { c, m, p in
         try! c.connect(to: p.identifier, discover: .all, timeout: 2)
@@ -144,14 +157,29 @@ if !base {
         wait(0.08)
         precondition(m.cancels.count == 2 && p.discoveryCalls == 1)
     }
-    scenario("already-terminal recovery starts queued request without recancelling") { c, m, p in
+    scenario("raw disconnected does not bypass a delayed terminal callback") { c, m, p in
         try! c.connect(to: p.identifier, discover: .all, timeout: 2)
         c.disconnect(from: p.identifier)
         try! c.connect(to: p.identifier, discover: .all, timeout: 2)
-        p.state = .disconnected // Simulate a missing terminal callback.
+        p.state = .disconnected // State becomes visible before the callback.
         var result: Bool?
         c.recoverPendingConnection(p.identifier) { result = $0 }
-        precondition(result == false && m.cancels.count == 1 && m.connects.count == 2)
+        precondition(result == nil && m.cancels.count == 1 && m.connects.count == 1)
+        m.disconnected(p) // Delayed OLD callback must run before replacement.
+        precondition(result == false && m.connects.count == 2)
+        m.connected(p)
+        precondition(p.discoveryCalls == 1)
+    }
+    scenario("missing terminal callback fails closed; a late callback still releases handoff") { c, m, p in
+        try! c.connect(to: p.identifier, discover: .all, timeout: 2)
+        p.state = .disconnected
+        var results = [Bool]()
+        c.recoverPendingConnection(p.identifier) { results.append($0) }
+        try! c.connect(to: p.identifier, discover: .all, timeout: 2)
+        wait(5.1)
+        precondition(results == [false] && m.connects.count == 1)
+        m.disconnected(p)
+        precondition(results == [false] && m.connects.count == 2)
         m.connected(p)
         precondition(p.discoveryCalls == 1)
     }

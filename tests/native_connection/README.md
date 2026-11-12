@@ -17,7 +17,8 @@ enabled for the fixed version.
 It covers cancel/replace ordering, replacement timeout, late connection success,
 queued cancellation, peer isolation, disconnect-all, radio power cycling, restored
 links and discovery retirement. Integration cases cover recovery joining a
-cancellation, queued replacements winning ownership, missing terminal callbacks,
+cancellation, queued replacements winning ownership, delayed terminal callbacks,
+watchdog failure with ownership retained,
 late native success, background timeout deferral/resume and radio loss.
 
 To reproduce the pre-integration release stall:

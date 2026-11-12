@@ -86,15 +86,17 @@ final class Central {
             completion(false)
             return
         }
+        if peripheral.state == .disconnected && activePeripherals[id] == nil &&
+            restoredPeripherals[id] == nil && !retiringConnections.contains(id) {
+            // This Central has no outstanding owner; terminal cleanup already ran.
+            completion(true)
+            return
+        }
         let request = PendingConnectionRecovery(completion)
         pendingRecovery[id] = request
         // Join an existing cancellation; it remains the sole owner until its
         // terminal callback. Do not cancel or clean up a second time.
-        if peripheral.state == .disconnected {
-            // Also recover a cancellation whose terminal callback was lost.
-            retiringConnections.insert(id)
-            finishRetiringConnection(peripheral, change: .disconnected(nil))
-        } else if !retiringConnections.contains(id) {
+        if !retiringConnections.contains(id) {
             disconnect(from: id)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
@@ -301,13 +303,12 @@ final class Central {
               fields: ["timeout_ms": Int((timeout ?? 0) * 1000)])
         let peripheral = try resolve(known: peripheralID)
 
-        if activePeripherals[peripheralID] != nil && !retiringConnections.contains(peripheralID) {
-            disconnect(from: peripheralID)
-        }
-        if retiringConnections.contains(peripheralID) {
+        if activePeripherals[peripheralID] != nil || retiringConnections.contains(peripheralID) {
+            // Record the replacement before cancellation can deliver terminal cleanup.
             pendingConnections[peripheralID] = { [weak self] in
                 self?.startConnection(to: peripheral, discover: servicesWithCharacteristicsToDiscover, timeout: timeout)
             }
+            beginRetiringConnection(peripheral)
             return
         }
         startConnection(to: peripheral, discover: servicesWithCharacteristicsToDiscover, timeout: timeout)
@@ -364,16 +365,18 @@ final class Central {
     func disconnect(from peripheralID: PeripheralID) {
         trace("disconnect_requested", device: peripheralID)
         pendingConnections.removeValue(forKey: peripheralID)
-        guard !retiringConnections.contains(peripheralID),
-              let peripheral = try? resolve(known: peripheralID)
-        else { return }
+        guard let peripheral = try? resolve(known: peripheralID) else { return }
+        beginRetiringConnection(peripheral)
+    }
 
+    private func beginRetiringConnection(_ peripheral: CBPeripheral) {
+        let peripheralID = peripheral.identifier
+        guard !retiringConnections.contains(peripheralID) else { return }
+        if peripheral.state == .disconnected && activePeripherals[peripheralID] == nil &&
+            restoredPeripherals[peripheralID] == nil { return }
         retiringConnections.insert(peripheralID)
-        if peripheral.state == .disconnected {
-            // A missing callback can leave a task behind an already-terminal link.
-            finishRetiringConnection(peripheral, change: .disconnected(nil))
-            return
-        }
+        // Even .disconnected can precede a queued terminal delegate callback.
+        // Only that callback releases ownership and authorizes a replacement.
         var cancelledTask = false
         connectRegistry.updateTask(key: peripheralID) {
             cancelledTask = true
