@@ -57,10 +57,14 @@ final class Central {
     private(set) var isScanning = false
     private(set) var activePeripherals = [PeripheralID: CBPeripheral]()
     private(set) var connectRegistry = PeripheralTaskRegistry<ConnectTaskController>()
+    // Native cancellation is asynchronous; keep ownership until its terminal callback.
+    private var retiringConnections = Set<PeripheralID>()
+    private var pendingConnections = [PeripheralID: () -> Void]()
     private let servicesWithCharacteristicsDiscoveryRegistry = PeripheralTaskRegistry<ServicesWithCharacteristicsDiscoveryTaskController>()
     private let characteristicNotifyRegistry = PeripheralTaskRegistry<CharacteristicNotifyTaskController>()
     private let characteristicWriteRegistry = PeripheralTaskRegistry<CharacteristicWriteTaskController>()
     private let readRssiRegistry = PeripheralTaskRegistry<ReadRssiTaskController>()
+    private let onConnectionChange: ConnectionChangeHandler
     private var pendingRecovery = [PeripheralID: PendingConnectionRecovery]()
 
     /// Called on the central's main queue. A queued didConnect must win over
@@ -72,25 +76,27 @@ final class Central {
             return
         }
         #endif
-        guard pendingRecovery[id] == nil, let peripheral = try? resolve(known: id) else {
+        guard pendingRecovery[id] == nil,
+              let peripheral = try? resolve(known: id) else {
             completion(false)
             return
         }
-        if peripheral.state == .connected {
+        if peripheral.state == .connected && !retiringConnections.contains(id) {
             connectRegistry.updateTask(key: id, action: { $0.handleConnectionChange(.connected) })
             completion(false)
             return
         }
-        if peripheral.state == .disconnected {
-            // A missing terminal callback may have left an old registry task
-            // at the head of this peripheral's queue. Retire it before retry.
-            retireConnectionTasks(peripheral)
-            completion(true)
-            return
-        }
         let request = PendingConnectionRecovery(completion)
         pendingRecovery[id] = request
-        disconnect(from: id)
+        // Join an existing cancellation; it remains the sole owner until its
+        // terminal callback. Do not cancel or clean up a second time.
+        if peripheral.state == .disconnected {
+            // Also recover a cancellation whose terminal callback was lost.
+            retiringConnections.insert(id)
+            finishRetiringConnection(peripheral, change: .disconnected(nil))
+        } else if !retiringConnections.contains(id) {
+            disconnect(from: id)
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
             // No acknowledgement means no permission to start a competing attempt.
             if self?.pendingRecovery[id] === request {
@@ -100,12 +106,21 @@ final class Central {
         }
     }
 
-    private func retireConnectionTasks(_ peripheral: CBPeripheral) {
-        connectRegistry.updateTasks(in: peripheral.identifier) {
-            $0.cancel(centralManager: self.centralManager, peripheral: peripheral,
-                      error: PluginError.connectionLost)
-        }
+    private func finishRetiringConnection(_ peripheral: CBPeripheral, change: ConnectionChange) {
+        let id = peripheral.identifier
+        // Retire tasks without another radio cancellation: the old link is terminal.
+        connectRegistry.updateTasks(in: id) { $0.retire(error: PluginError.connectionLost) }
         eject(peripheral, error: PluginError.connectionLost)
+        retiringConnections.remove(id)
+        let recovery = pendingRecovery.removeValue(forKey: id)
+        if let restart = pendingConnections.removeValue(forKey: id), state == .poweredOn {
+            restart()
+            // A normal replacement now owns the link; Dart must not replace it again.
+            recovery?.finish(false)
+        } else {
+            onConnectionChange(self, peripheral, change)
+            recovery?.finish(true)
+        }
     }
 
     // Peripherals iOS handed back on a state-restoration relaunch. Held only so
@@ -132,16 +147,24 @@ final class Central {
         onServicesWithCharacteristicsInitialDiscovery: @escaping ServicesWithCharacteristicsDiscoveryHandler,
         onCharacteristicValueUpdate: @escaping CharacteristicValueUpdateHandler
     ) {
+        self.onConnectionChange = onConnectionChange
         self.onServicesWithCharacteristicsInitialDiscovery = onServicesWithCharacteristicsInitialDiscovery
         self.centralManagerDelegate = CentralManagerDelegate(
             onStateChange: papply(weak: self) { central, state in
                 central.trace("state_changed", fields: ["state": state.rawValue])
                 if state != .poweredOn {
-                    central.activePeripherals.forEach { _, peripheral in
+                    central.finishPendingRecoveries()
+                    central.pendingConnections.removeAll()
+                    central.restoredPeripherals.removeAll()
+                    central.activePeripherals.forEach { id, peripheral in
                         let error = Failure.notPoweredOn(actualState: state)
+                        central.connectRegistry.updateTask(key: id) {
+                            $0.handleConnectionChange(.disconnected(error))
+                        }
                         central.eject(peripheral, error: error)
                         onConnectionChange(central, peripheral, .disconnected(error))
                     }
+                    central.retiringConnections.removeAll()
                 }
                 onStateChange(central, state)
             },
@@ -157,6 +180,15 @@ final class Central {
                 case .disconnected(let error):
                     central.trace("did_disconnect", device: peripheral.identifier, error: error)
                 }
+                if central.retiringConnections.contains(peripheral.identifier) {
+                    if case .connected = change {
+                        // A connection can win the race with cancellation. It is still retired.
+                        central.centralManager.cancelPeripheralConnection(peripheral)
+                        return
+                    }
+                    central.finishRetiringConnection(peripheral, change: change)
+                    return
+                }
                 central.connectRegistry.updateTask(
                     key: peripheral.identifier,
                     action: { $0.handleConnectionChange(change) }
@@ -170,14 +202,6 @@ final class Central {
                 }
 
                 onConnectionChange(central, peripheral, change)
-                switch change {
-                case .disconnected, .failedToConnect:
-                    if let recovered = central.pendingRecovery.removeValue(forKey: peripheral.identifier) {
-                        central.retireConnectionTasks(peripheral)
-                        recovered.finish(true)
-                    }
-                case .connected: break
-                }
             },
             onRestore: papply(weak: self) { central, peripherals in
                 central.trace("state_restored", fields: ["peripheral_count": peripherals.count])
@@ -277,6 +301,20 @@ final class Central {
               fields: ["timeout_ms": Int((timeout ?? 0) * 1000)])
         let peripheral = try resolve(known: peripheralID)
 
+        if activePeripherals[peripheralID] != nil && !retiringConnections.contains(peripheralID) {
+            disconnect(from: peripheralID)
+        }
+        if retiringConnections.contains(peripheralID) {
+            pendingConnections[peripheralID] = { [weak self] in
+                self?.startConnection(to: peripheral, discover: servicesWithCharacteristicsToDiscover, timeout: timeout)
+            }
+            return
+        }
+        startConnection(to: peripheral, discover: servicesWithCharacteristicsToDiscover, timeout: timeout)
+    }
+
+    private func startConnection(to peripheral: CBPeripheral, discover servicesWithCharacteristicsToDiscover: ServicesWithCharacteristicsToDiscover, timeout: TimeInterval?) {
+        let peripheralID = peripheral.identifier
         peripheral.delegate = peripheralDelegate
         activePeripherals[peripheral.identifier] = peripheral
         restoredPeripherals[peripheral.identifier] = nil
@@ -304,7 +342,12 @@ final class Central {
                     central.discoverServicesWithCharacteristics(
                         for: peripheral,
                         discover: servicesWithCharacteristicsToDiscover,
-                        completion: central.onServicesWithCharacteristicsInitialDiscovery
+                        completion: { [weak central] _, peripheral, errors in
+                            guard let central = central,
+                                  !central.retiringConnections.contains(peripheral.identifier)
+                            else { return }
+                            central.onServicesWithCharacteristicsInitialDiscovery(central, peripheral, errors)
+                        }
                     )
                 case .failedToConnect, .disconnected:
                     break
@@ -320,20 +363,32 @@ final class Central {
 
     func disconnect(from peripheralID: PeripheralID) {
         trace("disconnect_requested", device: peripheralID)
-        guard let peripheral = try? resolve(known: peripheralID)
+        pendingConnections.removeValue(forKey: peripheralID)
+        guard !retiringConnections.contains(peripheralID),
+              let peripheral = try? resolve(known: peripheralID)
         else { return }
 
-        centralManager.cancelPeripheralConnection(peripheral)
+        retiringConnections.insert(peripheralID)
+        if peripheral.state == .disconnected {
+            // A missing callback can leave a task behind an already-terminal link.
+            finishRetiringConnection(peripheral, change: .disconnected(nil))
+            return
+        }
+        var cancelledTask = false
+        connectRegistry.updateTask(key: peripheralID) {
+            cancelledTask = true
+            return $0.cancel(centralManager: centralManager, peripheral: peripheral, error: nil)
+        }
+        if !cancelledTask { centralManager.cancelPeripheralConnection(peripheral) }
     }
 
     func disconnectAll() {
         finishPendingRecoveries()
-        activePeripherals
-            .values
-            .forEach { peripheral in
-                trace("disconnect_all_requested", device: peripheral.identifier)
-                centralManager.cancelPeripheralConnection(peripheral)
-            }
+        pendingConnections.removeAll()
+        Set(activePeripherals.keys).union(restoredPeripherals.keys).forEach { id in
+            trace("disconnect_all_requested", device: id)
+            disconnect(from: id)
+        }
     }
 
     func discoverServicesWithCharacteristics(
@@ -478,6 +533,7 @@ final class Central {
     private func eject(_ peripheral: CBPeripheral, error: Error) {
         peripheral.delegate = nil
         activePeripherals[peripheral.identifier] = nil
+        restoredPeripherals[peripheral.identifier] = nil
 
         servicesWithCharacteristicsDiscoveryRegistry.updateTasks(
             in: peripheral.identifier,
